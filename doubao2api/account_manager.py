@@ -39,6 +39,7 @@ ACCOUNT_STATUSES = {
 }
 
 UNAVAILABLE_ACCOUNT_STATUSES = {
+    "starting",
     "not_logged_in",
     "captcha_required",
     "browser_error",
@@ -935,12 +936,72 @@ class DoubaoAccountManager:
         self._maintenance_heartbeats: Dict[str, asyncio.Task] = {}
         self.last_touch: Dict[str, float] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._active_operations: Dict[str, set[asyncio.Task[Any]]] = {}
+        self._operation_idle_events: Dict[str, asyncio.Event] = {}
+        self.maintenance_drain_timeout_seconds = float(
+            max(1, _env_int("DOUBAO_MAINTENANCE_DRAIN_TIMEOUT_SECONDS", 120))
+        )
         self.default_account_id = os.environ.get("DOUBAO_DEFAULT_ACCOUNT_ID", "default")
 
     def _lock_for(self, account_id: str) -> asyncio.Lock:
         if account_id not in self._locks:
             self._locks[account_id] = asyncio.Lock()
         return self._locks[account_id]
+
+    def _track_current_operation(self, account_id: str) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        self._track_operation_task(account_id, task)
+
+    def _track_operation_task(self, account_id: str, task: asyncio.Task[Any]) -> None:
+        active = self._active_operations.setdefault(account_id, set())
+        if task in active:
+            return
+        active.add(task)
+        idle = self._operation_idle_events.setdefault(account_id, asyncio.Event())
+        idle.clear()
+
+        def release(done: asyncio.Task[Any]) -> None:
+            operations = self._active_operations.get(account_id)
+            if operations is None:
+                return
+            operations.discard(done)
+            self._operation_idle_events.setdefault(account_id, asyncio.Event()).set()
+            if not operations:
+                self._active_operations.pop(account_id, None)
+
+        task.add_done_callback(release)
+
+    async def _wait_for_active_operations(self, account_id: str) -> None:
+        current = asyncio.current_task()
+        idle = self._operation_idle_events.setdefault(account_id, asyncio.Event())
+        deadline = asyncio.get_running_loop().time() + self.maintenance_drain_timeout_seconds
+        while True:
+            active = {
+                task
+                for task in self._active_operations.get(account_id, set())
+                if not task.done() and task is not current
+            }
+            if not active:
+                return
+            idle.clear()
+            if not any(
+                not task.done() and task is not current
+                for task in self._active_operations.get(account_id, set())
+            ):
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Timed out waiting for active account operations to finish: {account_id}"
+                )
+            try:
+                await asyncio.wait_for(idle.wait(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Timed out waiting for active account operations to finish: {account_id}"
+                ) from exc
 
     async def start(self) -> None:
         self.store.ensure_default_account()
@@ -963,6 +1024,7 @@ class DoubaoAccountManager:
         account_id: str,
         *,
         allow_pending_validation: bool = False,
+        track_operation: bool = False,
     ) -> tuple[Dict[str, Any], BrowserClient]:
         account = self.store.get(account_id)
         if not account:
@@ -976,16 +1038,20 @@ class DoubaoAccountManager:
 
         async with self._lock_for(account_id):
             account = self.store.get(account_id) or account
-            if account.get("status") == "maintenance_pending_validation" and not allow_pending_validation:
+            pending_validation = account.get("status") == "maintenance_pending_validation"
+            if pending_validation and not allow_pending_validation:
                 raise RuntimeError(f"Account requires validation after maintenance: {account_id}")
             if self.store.is_in_maintenance(account_id):
                 raise RuntimeError(f"Account is in maintenance: {account_id}")
             client = self.clients.get(account_id)
             if client and client.page and client._context:
                 self.last_touch[account_id] = time.time()
+                if track_operation:
+                    self._track_current_operation(account_id)
                 return account, client
 
-            self.store.update_account(account_id, status="starting", last_error="")
+            if not pending_validation:
+                self.store.update_account(account_id, status="starting", last_error="")
             cookie_header = os.environ.get("DOUBAO_COOKIE", "") if account_id == "default" else ""
             from .browser_client import BrowserClient
             client = BrowserClient(
@@ -1006,13 +1072,16 @@ class DoubaoAccountManager:
 
             self.clients[account_id] = client
             self.last_touch[account_id] = time.time()
-            self.store.update_account(
-                account_id,
-                status="ready" if client.is_ready else "not_logged_in",
-                last_error="" if client.is_ready else "未登录",
-                last_validated_at=_now(),
-            )
+            if not pending_validation:
+                self.store.update_account(
+                    account_id,
+                    status="ready" if client.is_ready else "not_logged_in",
+                    last_error="" if client.is_ready else "未登录",
+                    last_validated_at=_now(),
+                )
             await self.prune_idle(exclude={account_id})
+            if track_operation:
+                self._track_current_operation(account_id)
             return self.store.get(account_id) or account, client
 
     async def get_ready_client(
@@ -1023,7 +1092,7 @@ class DoubaoAccountManager:
         quota_units: int = 1,
     ) -> tuple[Dict[str, Any], BrowserClient]:
         if preferred_account_id:
-            account, client = await self.ensure_client(preferred_account_id)
+            account, client = await self.ensure_client(preferred_account_id, track_operation=True)
             self._ensure_ready(account, client)
             if not self.store.has_quota(account, quota_kind, quota_units):
                 snapshot = self.store.quota_snapshot(account, str(quota_kind))
@@ -1045,22 +1114,25 @@ class DoubaoAccountManager:
         if not accounts:
             raise RuntimeError(f"No enabled Doubao accounts with available {quota_kind or 'general'} quota")
 
-        hot_ready = []
-        for account in accounts:
-            client = self.clients.get(account["id"])
-            if client and client.is_ready and not client.needs_captcha:
-                hot_ready.append(account)
-        if hot_ready:
-            hot_ready.sort(key=lambda a: a.get("last_used_at") or 0)
-            account = hot_ready[0]
-            client = self.clients[account["id"]]
-            self.last_touch[account["id"]] = time.time()
-            return account, client
+        for candidate in sorted(accounts, key=lambda a: a.get("last_used_at") or 0):
+            account_id = candidate["id"]
+            async with self._lock_for(account_id):
+                account = self.store.get(account_id) or candidate
+                if (
+                    str(account.get("status") or "").lower() in UNAVAILABLE_ACCOUNT_STATUSES
+                    or self.store.is_in_maintenance(account_id)
+                ):
+                    continue
+                client = self.clients.get(account_id)
+                if client and client.is_ready and not client.needs_captcha:
+                    self.last_touch[account_id] = time.time()
+                    self._track_current_operation(account_id)
+                    return account, client
 
         last_error = ""
         for account in sorted(accounts, key=lambda a: a.get("last_used_at") or 0):
             try:
-                account, client = await self.ensure_client(account["id"])
+                account, client = await self.ensure_client(account["id"], track_operation=True)
                 self._ensure_ready(account, client)
                 self.last_touch[account["id"]] = time.time()
                 return account, client
@@ -1094,11 +1166,24 @@ class DoubaoAccountManager:
         if not account:
             raise KeyError(f"Account not found: {account_id}")
         owner = uuid.uuid4().hex
-        self.store.begin_maintenance(account_id, owner)
         client: Optional[BrowserClient] = None
+        lease_started = False
         try:
-            await self.stop_client(account_id, update_status=False)
             async with self._lock_for(account_id):
+                if account_id in self.maintenance_clients or account_id in self.maintenance_owners:
+                    raise RuntimeError(f"Account already has a local maintenance browser: {account_id}")
+                self.store.begin_maintenance(account_id, owner)
+                lease_started = True
+
+            await self._wait_for_active_operations(account_id)
+
+            async with self._lock_for(account_id):
+                if account_id in self.maintenance_clients or account_id in self.maintenance_owners:
+                    raise RuntimeError(f"Account already has a local maintenance browser: {account_id}")
+                normal_client = self.clients.pop(account_id, None)
+                self.last_touch.pop(account_id, None)
+                if normal_client:
+                    await normal_client.stop()
                 from .browser_client import BrowserClient
 
                 client = BrowserClient(
@@ -1114,9 +1199,13 @@ class DoubaoAccountManager:
                     self._maintenance_heartbeat_loop(account_id, owner)
                 )
         except Exception as exc:
-            self.maintenance_clients.pop(account_id, None)
-            self.maintenance_owners.pop(account_id, None)
-            task = self._maintenance_heartbeats.pop(account_id, None)
+            owns_local_session = self.maintenance_owners.get(account_id) == owner
+            owns_new_client = client is not None and self.maintenance_clients.get(account_id) is client
+            if owns_new_client:
+                self.maintenance_clients.pop(account_id, None)
+            if owns_local_session:
+                self.maintenance_owners.pop(account_id, None)
+            task = self._maintenance_heartbeats.pop(account_id, None) if owns_local_session else None
             if task:
                 task.cancel()
             if client is not None:
@@ -1124,10 +1213,11 @@ class DoubaoAccountManager:
                     await client.stop()
                 except Exception:
                     pass
-            try:
-                self.store.end_maintenance(account_id, owner, str(exc))
-            except Exception:
-                pass
+            if lease_started:
+                try:
+                    self.store.end_maintenance(account_id, owner, str(exc))
+                except Exception:
+                    pass
             raise
         status = self.store.maintenance_status(account_id)
         status["novnc_url"] = os.environ.get("DOUBAO_NOVNC_URL", "http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale")
@@ -1287,7 +1377,7 @@ class DoubaoAccountManager:
         )
 
     async def sync_provider_credit(self, account_id: str) -> Dict[str, Any]:
-        account, client = await self.ensure_client(account_id)
+        account, client = await self.ensure_client(account_id, track_operation=True)
         self._ensure_ready(account, client)
         sync_data = await client.get_credit_quota()
         account = self.store.update_provider_credit(account_id, sync_data) or account
@@ -1308,14 +1398,18 @@ class DoubaoAccountManager:
         return None
 
     async def cookies(self, account_id: str) -> list[Dict[str, Any]]:
-        _, client = await self.ensure_client(account_id)
+        _, client = await self.ensure_client(account_id, track_operation=True)
         if client._context is None:
             return []
         cookies = await client._context.cookies("https://www.doubao.com")
         return [{"name": c["name"], "value": c["value"], "length": len(c["value"])} for c in cookies]
 
     async def login_status(self, account_id: str) -> Dict[str, Any]:
-        account, client = await self.ensure_client(account_id, allow_pending_validation=True)
+        account, client = await self.ensure_client(
+            account_id,
+            allow_pending_validation=True,
+            track_operation=True,
+        )
         page_url = client.page.url if client.page else ""
         login_btn_count = 0
         if client.page:
@@ -1325,7 +1419,12 @@ class DoubaoAccountManager:
                 pass
         actual_logged_in = client.is_ready and login_btn_count == 0
         status = "ready" if actual_logged_in else "not_logged_in"
-        self.store.update_account(account_id, status=status, last_error="" if actual_logged_in else "未登录")
+        self.store.update_account(
+            account_id,
+            status=status,
+            last_error="" if actual_logged_in else "未登录",
+            last_validated_at=_now(),
+        )
         return {
             "account_id": account_id,
             "account_name": account.get("name", account_id),

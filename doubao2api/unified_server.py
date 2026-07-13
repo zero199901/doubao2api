@@ -3119,7 +3119,7 @@ def create_app(
     async def admin_start_account(account_id: str, request: Request):
         _check_auth(request)
         try:
-            account, client = await accounts.ensure_client(account_id)
+            account, client = await accounts.ensure_client(account_id, track_operation=True)
             return JSONResponse({
                 "status": "ready" if client.is_ready else "not_logged_in",
                 "account": accounts.store.get(account_id) or account,
@@ -3273,12 +3273,13 @@ def create_app(
         body = await _json_or_empty(request)
         account_id = _admin_account_id(request, body)
         try:
-            account, client = await accounts.ensure_client(account_id)
+            account, client = await accounts.ensure_client(account_id, track_operation=True)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         if client.is_ready:
             return {"status": "already_logged_in", "account_id": account["id"]}
-        asyncio.create_task(_do_login(account["id"], client))
+        login_task = asyncio.create_task(_do_login(account["id"], client))
+        accounts._track_operation_task(account["id"], login_task)
         return {"status": "login_started", "account_id": account["id"], "message": "QR code displayed in browser. Scan to login."}
 
     @app.post("/auth/reset_captcha")

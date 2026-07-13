@@ -72,8 +72,10 @@ docker run -d --name doubao-web-01 \
 
 使用 `Dockerfile.novnc` 时必须设置 `VNC_PASSWORD`，并将容器 `6080` 仅映射到宿主机
 `127.0.0.1`。`DOUBAO_NOVNC_URL` 是后台展示的私有入口。检修会先写入 SQLite 租约、
-停止该账户的常驻无头浏览器，再以 `headless=False` 打开原账户 `user_data_dir`；租约
-活动期间账号选择和浏览器启动都会拒绝使用该账户。
+阻止新任务，并等待已经借用浏览器的任务结束，再停止该账户的常驻无头浏览器，以
+`headless=False` 打开原账户 `user_data_dir`。等待时间由
+`DOUBAO_MAINTENANCE_DRAIN_TIMEOUT_SECONDS` 控制，默认 120 秒；超时会释放维护租约并保留
+普通浏览器，不会中断仍在执行的任务。租约活动期间账号选择和浏览器启动都会拒绝使用该账户。
 
 接口为 `/admin/api/accounts/{id}/maintenance/{start|heartbeat|stop|validate}`。豆包登录
 状态直接持久化到 profile，不需要 Cookie 捕获步骤。默认不清理 Chromium
