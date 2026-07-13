@@ -342,6 +342,8 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
               <span :class="['badge',selectedAccount.status]">{{statusText(selectedAccount)}}</span>
             </div>
             <div class="actions" style="margin-bottom:16px">
+              <button v-if="selectedAccount.maintenance?.state==='active'" class="btn primary" @click="startMaintenance(selectedAccount.id)">检修</button>
+              <button v-else-if="selectedAccount.maintenance?.state==='maintenance'" class="btn" @click="stopMaintenance(selectedAccount.id)">结束检修</button>
               <button class="btn primary" @click="startQr(selectedAccount.id)">扫码登录</button>
               <button class="btn" @click="probe(selectedAccount.id)" :disabled="probeState.loading">测活</button>
               <button class="btn" @click="startAccount(selectedAccount.id)">启动</button>
@@ -669,6 +671,17 @@ createApp({
     async function startAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/start`,{method:"POST"});await loadAccounts()}
     async function stopAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/stop`,{method:"POST"});await loadAccounts()}
     async function restartAccount(id){await api(`/admin/api/accounts/${encodeURIComponent(id)}/restart`,{method:"POST"});await loadAccounts()}
+    async function startMaintenance(id){
+      const data=await api(`/admin/api/accounts/${encodeURIComponent(id)}/maintenance/start`,{method:"POST"});
+      showVnc.value=true;
+      await loadAccounts();
+      return data;
+    }
+    async function stopMaintenance(id){
+      await api(`/admin/api/accounts/${encodeURIComponent(id)}/maintenance/stop`,{method:"POST"});
+      showVnc.value=false;
+      await loadAccounts();
+    }
     async function probe(id){
       probeState.loading=true;probeState.status="";probeState.message="";
       try{
@@ -792,7 +805,7 @@ createApp({
       setInterval(()=>{if(tab.value==="logs")loadLogs()},5000);
       setInterval(()=>{loadAccounts()},15000);
     });
-    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,serviceKey,apiBase,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,deleteAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock,saveServiceKey};
+    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,serviceKey,apiBase,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,deleteAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,startMaintenance,stopMaintenance,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock,saveServiceKey};
   }
 }).mount("#app");
 </script>

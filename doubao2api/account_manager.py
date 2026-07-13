@@ -33,6 +33,7 @@ ACCOUNT_STATUSES = {
     "error",
     "browser_error",
     "temporarily_blocked",
+    "maintenance_pending_validation",
     "stopped",
     "disabled",
 }
@@ -42,6 +43,7 @@ UNAVAILABLE_ACCOUNT_STATUSES = {
     "captcha_required",
     "browser_error",
     "temporarily_blocked",
+    "maintenance_pending_validation",
     "disabled",
 }
 
@@ -192,6 +194,20 @@ class DoubaoAccountStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_doubao_accounts_status ON doubao_accounts(status)")
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS doubao_account_maintenance (
+                    account_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_expires_at INTEGER,
+                    profile_path TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS doubao_account_usage (
                     id TEXT PRIMARY KEY,
                     account_id TEXT NOT NULL,
@@ -314,6 +330,110 @@ class DoubaoAccountStore:
                 (account_id,),
             ).fetchone()
         return self._row_to_dict(row) if row else None
+
+    def begin_maintenance(self, account_id: str, owner: str, ttl_seconds: int = 900) -> Dict[str, Any]:
+        account = self.get(account_id)
+        if not account:
+            raise KeyError(f"Account not found: {account_id}")
+        owner = str(owner or "").strip()
+        if not owner:
+            raise ValueError("Maintenance lease owner is required")
+        now = _now()
+        expires_at = now + max(60, int(ttl_seconds))
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO doubao_account_maintenance (
+                    account_id, state, lease_owner, lease_expires_at, profile_path,
+                    last_error, created_at, updated_at
+                ) VALUES (?, 'maintenance', ?, ?, ?, '', ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    state='maintenance', lease_owner=excluded.lease_owner,
+                    lease_expires_at=excluded.lease_expires_at,
+                    profile_path=excluded.profile_path, last_error='', updated_at=excluded.updated_at
+                WHERE doubao_account_maintenance.state NOT IN ('maintenance', 'validating')
+                   OR doubao_account_maintenance.lease_expires_at < ?
+                   OR doubao_account_maintenance.lease_owner = excluded.lease_owner
+                """,
+                (account_id, owner, expires_at, account["user_data_dir"], now, now, now),
+            )
+            if cur.rowcount == 0:
+                raise RuntimeError(f"Account {account_id} already has an active maintenance lease")
+        return self.maintenance_status(account_id)
+
+    def heartbeat_maintenance(self, account_id: str, owner: str, ttl_seconds: int = 900) -> Dict[str, Any]:
+        now = _now()
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE doubao_account_maintenance
+                   SET lease_expires_at = ?, updated_at = ?
+                 WHERE account_id = ? AND lease_owner = ? AND state IN ('maintenance', 'validating')
+                   AND lease_expires_at > ?
+                """,
+                (now + max(60, int(ttl_seconds)), now, account_id, owner, now),
+            )
+            if cur.rowcount == 0:
+                raise RuntimeError("Maintenance lease is not owned by this session")
+        return self.maintenance_status(account_id)
+
+    def end_maintenance(self, account_id: str, owner: str, last_error: str = "") -> Dict[str, Any]:
+        now = _now()
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE doubao_account_maintenance
+                   SET state='active', lease_owner='', lease_expires_at=NULL,
+                       last_error=?, updated_at=?
+                 WHERE account_id=? AND (lease_owner=? OR lease_expires_at < ?)
+                """,
+                (str(last_error or "")[:500], now, account_id, owner, now),
+            )
+            if cur.rowcount == 0:
+                raise RuntimeError("Maintenance lease is not owned by this session")
+        return self.maintenance_status(account_id)
+
+    def maintenance_status(self, account_id: str) -> Dict[str, Any]:
+        account = self.get(account_id)
+        if not account:
+            raise KeyError(f"Account not found: {account_id}")
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM doubao_account_maintenance WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "account_id": account_id,
+                "state": "active",
+                "lease_owner": "",
+                "lease_expires_at": None,
+                "profile_path": account["user_data_dir"],
+                "last_error": "",
+            }
+        result = dict(row)
+        if result.get("state") in {"maintenance", "validating"} and int(result.get("lease_expires_at") or 0) <= _now():
+            previous_expiry = result.get("lease_expires_at")
+            with self._lock, self._connection() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE doubao_account_maintenance
+                       SET state='active', lease_owner='', lease_expires_at=NULL, updated_at=?
+                     WHERE account_id=? AND lease_expires_at=?
+                       AND state IN ('maintenance', 'validating')
+                    """,
+                    (_now(), account_id, previous_expiry),
+                )
+            if cur.rowcount == 0:
+                return self.maintenance_status(account_id)
+            result.update(state="active", lease_owner="", lease_expires_at=None)
+        return result
+
+    def is_in_maintenance(self, account_id: str) -> bool:
+        try:
+            return self.maintenance_status(account_id).get("state") in {"maintenance", "validating"}
+        except KeyError:
+            return False
 
     def update_account(self, account_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         allowed = {
@@ -743,9 +863,12 @@ class DoubaoAccountStore:
         account = self.get(account_id)
         if not account:
             return {"deleted": False, "account_id": account_id, "cleanup": []}
+        if self.is_in_maintenance(account_id):
+            raise RuntimeError(f"Account {account_id} has an active maintenance lease")
 
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM doubao_account_usage WHERE account_id = ?", (account_id,))
+            conn.execute("DELETE FROM doubao_account_maintenance WHERE account_id = ?", (account_id,))
             cur = conn.execute("DELETE FROM doubao_accounts WHERE id = ?", (account_id,))
             deleted = cur.rowcount > 0
         cleanup = self._cleanup_account_files(account) if deleted else []
@@ -807,6 +930,9 @@ class DoubaoAccountManager:
         self.max_hot_accounts = max_hot_accounts or int(os.environ.get("DOUBAO_MAX_HOT_ACCOUNTS", "2"))
         self.idle_ttl_seconds = idle_ttl_seconds
         self.clients: Dict[str, BrowserClient] = {}
+        self.maintenance_clients: Dict[str, BrowserClient] = {}
+        self.maintenance_owners: Dict[str, str] = {}
+        self._maintenance_heartbeats: Dict[str, asyncio.Task] = {}
         self.last_touch: Dict[str, float] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self.default_account_id = os.environ.get("DOUBAO_DEFAULT_ACCOUNT_ID", "default")
@@ -827,17 +953,33 @@ class DoubaoAccountManager:
                 pass
 
     async def stop_all(self) -> None:
+        for account_id in list(self.maintenance_clients):
+            await self.stop_maintenance(account_id)
         for account_id in list(self.clients):
             await self.stop_client(account_id, update_status=False)
 
-    async def ensure_client(self, account_id: str) -> tuple[Dict[str, Any], BrowserClient]:
+    async def ensure_client(
+        self,
+        account_id: str,
+        *,
+        allow_pending_validation: bool = False,
+    ) -> tuple[Dict[str, Any], BrowserClient]:
         account = self.store.get(account_id)
         if not account:
             raise KeyError(f"Account not found: {account_id}")
         if not account.get("enabled"):
             raise RuntimeError(f"Account disabled: {account_id}")
+        if account.get("status") == "maintenance_pending_validation" and not allow_pending_validation:
+            raise RuntimeError(f"Account requires validation after maintenance: {account_id}")
+        if self.store.is_in_maintenance(account_id):
+            raise RuntimeError(f"Account is in maintenance: {account_id}")
 
         async with self._lock_for(account_id):
+            account = self.store.get(account_id) or account
+            if account.get("status") == "maintenance_pending_validation" and not allow_pending_validation:
+                raise RuntimeError(f"Account requires validation after maintenance: {account_id}")
+            if self.store.is_in_maintenance(account_id):
+                raise RuntimeError(f"Account is in maintenance: {account_id}")
             client = self.clients.get(account_id)
             if client and client.page and client._context:
                 self.last_touch[account_id] = time.time()
@@ -897,6 +1039,7 @@ class DoubaoAccountManager:
             for a in self.store.list_accounts()
             if a.get("enabled")
             and str(a.get("status") or "").lower() not in UNAVAILABLE_ACCOUNT_STATUSES
+            and not self.store.is_in_maintenance(a["id"])
             and self.store.has_quota(a, quota_kind, quota_units)
         ]
         if not accounts:
@@ -946,6 +1089,104 @@ class DoubaoAccountManager:
         await self.stop_client(account_id, update_status=False)
         return await self.ensure_client(account_id)
 
+    async def start_maintenance(self, account_id: str) -> Dict[str, Any]:
+        account = self.store.get(account_id)
+        if not account:
+            raise KeyError(f"Account not found: {account_id}")
+        owner = uuid.uuid4().hex
+        self.store.begin_maintenance(account_id, owner)
+        client: Optional[BrowserClient] = None
+        try:
+            await self.stop_client(account_id, update_status=False)
+            async with self._lock_for(account_id):
+                from .browser_client import BrowserClient
+
+                client = BrowserClient(
+                    headless=False,
+                    user_data_dir=account["user_data_dir"],
+                    session_file=account["session_file"],
+                    cookie_header=os.environ.get("DOUBAO_COOKIE", "") if account_id == "default" else "",
+                )
+                await client.start()
+                self.maintenance_clients[account_id] = client
+                self.maintenance_owners[account_id] = owner
+                self._maintenance_heartbeats[account_id] = asyncio.create_task(
+                    self._maintenance_heartbeat_loop(account_id, owner)
+                )
+        except Exception as exc:
+            self.maintenance_clients.pop(account_id, None)
+            self.maintenance_owners.pop(account_id, None)
+            task = self._maintenance_heartbeats.pop(account_id, None)
+            if task:
+                task.cancel()
+            if client is not None:
+                try:
+                    await client.stop()
+                except Exception:
+                    pass
+            try:
+                self.store.end_maintenance(account_id, owner, str(exc))
+            except Exception:
+                pass
+            raise
+        status = self.store.maintenance_status(account_id)
+        status["novnc_url"] = os.environ.get("DOUBAO_NOVNC_URL", "http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale")
+        return status
+
+    async def _maintenance_heartbeat_loop(self, account_id: str, owner: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(300)
+                self.store.heartbeat_maintenance(account_id, owner)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.stop_maintenance(account_id, owner=owner, last_error=str(exc))
+
+    async def stop_maintenance(
+        self,
+        account_id: str,
+        *,
+        owner: str = "",
+        last_error: str = "",
+    ) -> Dict[str, Any]:
+        current = self.store.maintenance_status(account_id)
+        lease_owner = str(current.get("lease_owner") or "")
+        local_owner = self.maintenance_owners.get(account_id, "")
+        foreign_lease = bool(lease_owner and lease_owner != local_owner)
+        if foreign_lease and not local_owner:
+            raise RuntimeError("Active maintenance lease is owned by another process")
+        if owner and local_owner and owner != local_owner:
+            raise RuntimeError("Maintenance lease owner does not match this process")
+        async with self._lock_for(account_id):
+            client = self.maintenance_clients.pop(account_id, None)
+            if client:
+                await client.stop()
+            task = self._maintenance_heartbeats.pop(account_id, None)
+            self.maintenance_owners.pop(account_id, None)
+            if task and task is not asyncio.current_task():
+                task.cancel()
+            if lease_owner:
+                if foreign_lease:
+                    raise RuntimeError("Local maintenance browser was stopped, but the active lease belongs to another process")
+                self.store.end_maintenance(account_id, local_owner, last_error)
+            if local_owner:
+                self.store.update_account(
+                    account_id,
+                    status="browser_error" if last_error else "maintenance_pending_validation",
+                    last_error=last_error,
+                )
+        return self.store.maintenance_status(account_id)
+
+    def maintenance_status(self, account_id: str) -> Dict[str, Any]:
+        status = self.store.maintenance_status(account_id)
+        account = self.store.get(account_id)
+        if status.get("state") == "active" and account and account.get("status") == "maintenance_pending_validation":
+            status["state"] = "validating"
+        status["browser_running"] = account_id in self.maintenance_clients
+        status["novnc_url"] = os.environ.get("DOUBAO_NOVNC_URL", "http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale")
+        return status
+
     async def prune_idle(self, exclude: Optional[set[str]] = None) -> None:
         exclude = exclude or set()
         if self.max_hot_accounts <= 0:
@@ -971,6 +1212,7 @@ class DoubaoAccountManager:
                 "page_url": client.page.url if client and client.page else "",
             }
             account["runtime"] = runtime
+            account["maintenance"] = self.maintenance_status(account["id"])
             account["quota_status"] = self.store.quota_status(account)
             account["provider_sync"] = self.store.provider_sync_status(account)
             rows.append(account)
@@ -1073,7 +1315,7 @@ class DoubaoAccountManager:
         return [{"name": c["name"], "value": c["value"], "length": len(c["value"])} for c in cookies]
 
     async def login_status(self, account_id: str) -> Dict[str, Any]:
-        account, client = await self.ensure_client(account_id)
+        account, client = await self.ensure_client(account_id, allow_pending_validation=True)
         page_url = client.page.url if client.page else ""
         login_btn_count = 0
         if client.page:

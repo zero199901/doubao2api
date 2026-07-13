@@ -185,7 +185,7 @@ class BrowserClient:
 
     def _clear_stale_profile_locks(self):
         """Remove Chromium profile singleton locks left by a crashed/replaced container."""
-        if os.environ.get("DOUBAO_CLEAR_STALE_PROFILE_LOCKS", "true").lower() == "false":
+        if os.environ.get("DOUBAO_CLEAR_STALE_PROFILE_LOCKS", "false").lower() != "true":
             return
         if not self.user_data_dir:
             return

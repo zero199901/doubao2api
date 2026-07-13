@@ -3102,9 +3102,13 @@ def create_app(
         _check_auth(request)
         if account_id in {"default", accounts.default_account_id}:
             raise HTTPException(status_code=400, detail="Default account cannot be deleted. Disable or reset it instead.")
-        await accounts.stop_client(account_id, update_status=False)
         try:
+            if accounts.store.is_in_maintenance(account_id) or account_id in accounts.maintenance_clients:
+                await accounts.stop_maintenance(account_id)
+            await accounts.stop_client(account_id, update_status=False)
             result = accounts.store.delete_account(account_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not result.get("deleted"):
@@ -3142,6 +3146,62 @@ def create_app(
             })
         except Exception as exc:
             return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
+    @app.get("/admin/api/accounts/{account_id}/maintenance")
+    async def admin_account_maintenance_status(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            return JSONResponse(accounts.maintenance_status(account_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/admin/api/accounts/{account_id}/maintenance/start")
+    async def admin_account_maintenance_start(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            return JSONResponse(await accounts.start_maintenance(account_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return JSONResponse({"status": "error", "message": str(exc)[:500]}, status_code=409)
+
+    @app.post("/admin/api/accounts/{account_id}/maintenance/heartbeat")
+    async def admin_account_maintenance_heartbeat(account_id: str, request: Request):
+        _check_auth(request)
+        body = await _json_or_empty(request)
+        try:
+            owner = str(body.get("lease_owner") or accounts.maintenance_owners.get(account_id) or "")
+            if not owner:
+                raise RuntimeError("Maintenance lease owner is required")
+            return JSONResponse(accounts.store.heartbeat_maintenance(account_id, owner))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return JSONResponse({"status": "error", "message": str(exc)[:500]}, status_code=409)
+
+    @app.post("/admin/api/accounts/{account_id}/maintenance/stop")
+    async def admin_account_maintenance_stop(account_id: str, request: Request):
+        _check_auth(request)
+        try:
+            return JSONResponse(await accounts.stop_maintenance(account_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            return JSONResponse({"status": "error", "message": str(exc)[:500]}, status_code=409)
+
+    @app.post("/admin/api/accounts/{account_id}/maintenance/validate")
+    async def admin_account_maintenance_validate(account_id: str, request: Request):
+        _check_auth(request)
+        if accounts.store.is_in_maintenance(account_id) or account_id in accounts.maintenance_clients:
+            return JSONResponse(
+                {"status": "error", "message": "Stop the maintenance browser before validation."},
+                status_code=409,
+            )
+        try:
+            status = await accounts.login_status(account_id)
+            return JSONResponse({"status": "valid" if status.get("logged_in") else "invalid", "data": status})
+        except Exception as exc:
+            return JSONResponse({"status": "invalid", "message": str(exc)[:500]}, status_code=424)
 
     @app.post("/admin/api/accounts/{account_id}/quota/sync")
     async def admin_sync_account_quota(account_id: str, request: Request):
